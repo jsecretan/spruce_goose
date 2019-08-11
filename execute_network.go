@@ -26,16 +26,12 @@ import (
 
 const CONNECTIONS_PER_NEURON = 1000
 const NEURONS_IN_BLOCK int = 10000
-const TOTAL_NEURONS uint64 = 100000
 const MAX_ITERATIONS int = 1
 const NEURAL_DATA_BUCKET = "spruce-goose-neural-data"
 // We consolidate value files, and here's how many we should put together
 const FILES_PER_VALUE_BLOCK = 16
 // We assume that workers > physical disks
 const PHYSICAL_DISKS = 8
-
-// Big ole' array to store the neural values from the whole system
-var neuronValuesCurrentStep [TOTAL_NEURONS]float32
 
 // Get blockfiles from the several physical disk directories
 // Gets in an order that round-robins their physical disks
@@ -84,7 +80,7 @@ func blockNumberToDirectoryPrefix(blockNumber int) string {
 }
 
 // Writes a randomized neural connection file
-func writeNeuralBlockWorker(neuralBlockFileChannel <-chan string, wg *sync.WaitGroup) {
+func writeNeuralBlockWorker(totalNeurons uint64, neuralBlockFileChannel <-chan string, wg *sync.WaitGroup) {
 
 	defer wg.Done()
 
@@ -109,7 +105,7 @@ func writeNeuralBlockWorker(neuralBlockFileChannel <-chan string, wg *sync.WaitG
 			binary.LittleEndian.PutUint32(connectionsPerNeuronBuffer, uint32(CONNECTIONS_PER_NEURON))
 			writer.Write(connectionsPerNeuronBuffer) // todo make a short and vary the number
 			for col := 0; col < CONNECTIONS_PER_NEURON; col++ {
-				connected_neuron := uint64(r.Int63n(int64(TOTAL_NEURONS)))
+				connected_neuron := uint64(r.Int63n(int64(totalNeurons)))
 				binary.LittleEndian.PutUint64(connectionBuffer, connected_neuron)
 				// Trimming this to 5 bytes becuse that's the minimum we need to store 
 				writer.Write(connectionBuffer[0:5])
@@ -124,7 +120,7 @@ func writeNeuralBlockWorker(neuralBlockFileChannel <-chan string, wg *sync.WaitG
 }
 
 // Load the latest iteration of weight files into in-memory array
-func loadValueFilesToArray(iteration int) {
+func loadValueFilesToArray(neuronValuesCurrentStep []float32, iteration int) {
 	//client, _ := hdfs.New("localhost:8020")
 	directoryName := fmt.Sprintf("%d/values/", iteration)
 	input := &s3.ListObjectsInput{
@@ -311,7 +307,7 @@ func consolidateFilesToDFS(iteration int, valueFileGroups <-chan []string, wg *s
 	}
 }
 
-func neuralBlockWorker(iteration int, blockFiles <-chan string, fn activation, wg *sync.WaitGroup) {
+func neuralBlockWorker(neuronValuesCurrentStep []float32, iteration int, blockFiles <-chan string, fn activation, wg *sync.WaitGroup) {
 
 	defer wg.Done()
 
@@ -379,8 +375,13 @@ func main() {
 	baseDirectory := os.Args[3]
 	var totalNodes int
 	totalNodes,_ = strconv.Atoi(os.Args[2])
+	totalNeuronsInt,_ := strconv.Atoi(os.Args[4])
+	var totalNeurons = uint64(totalNeuronsInt)
+
+	// Big ole' slice to store the neural values from the whole system
+	neuronValuesCurrentStep := make([]float32, totalNeurons)
 	
-	var blocks_per_node uint64 = uint64(math.Ceil((float64(TOTAL_NEURONS)/float64(NEURONS_IN_BLOCK))/float64(totalNodes)))
+	var blocks_per_node uint64 = uint64(math.Ceil((float64(totalNeurons)/float64(NEURONS_IN_BLOCK))/float64(totalNodes)))
 	// TODO Account for stragglers in the last node
 
 	fmt.Printf("Running with %d blocks per node\n", blocks_per_node)
@@ -405,7 +406,7 @@ func main() {
 	var neuralBlockWg sync.WaitGroup
 	neuralBlockWg.Add(numberOfWorkers)
 	for w := 0; w < numberOfWorkers; w++ {
-		go writeNeuralBlockWorker(neuralBlockFileChannel, &neuralBlockWg)
+		go writeNeuralBlockWorker(totalNeurons, neuralBlockFileChannel, &neuralBlockWg)
 	}
 	neuralBlockWg.Wait()
 	time2 := time.Now()
@@ -449,7 +450,7 @@ func main() {
 			var blockLoadWg sync.WaitGroup
 			blockLoadWg.Add(numberOfWorkers)
 			for w := 0; w < numberOfWorkers; w++ {
-	        	go neuralBlockWorker(currentIteration, blockFilesChannel, sigmoid, &blockLoadWg)
+	        	go neuralBlockWorker(neuronValuesCurrentStep, currentIteration, blockFilesChannel, sigmoid, &blockLoadWg)
 	    	}
 			blockLoadWg.Wait()
 			time2 = time.Now()
@@ -494,7 +495,7 @@ func main() {
 
 		// Now iterate through all the files on S3
 		fmt.Printf("Loading value files for next iteration\n")
-		loadValueFilesToArray(currentIteration)
+		loadValueFilesToArray(neuronValuesCurrentStep, currentIteration)
 
 	}
 
