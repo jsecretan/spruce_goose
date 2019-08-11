@@ -28,11 +28,8 @@ import (
 const CONNECTIONS_PER_NEURON = 1000
 const NEURONS_IN_BLOCK int = 10000
 const TOTAL_NEURONS uint64 = 100000
-const TOTAL_NODES uint64 = 1
 const MAX_ITERATIONS int = 1
 const NEURAL_DATA_BUCKET = "spruce-goose-neural-data"
-const REDIS_SERVER = "localhost:6379"
-const BASE_DIRECTORY = "/Users/jsecretan/code/spruce_goose"
 // We consolidate value files, and here's how many we should put together
 const FILES_PER_VALUE_BLOCK = 16
 // We assume that workers > physical disks
@@ -43,14 +40,14 @@ var neuronValuesCurrentStep [TOTAL_NEURONS]float32
 
 // Get blockfiles from the several physical disk directories
 // Gets in an order that round-robins their physical disks
-func getBlockFiles() []string {
+func getBlockFiles(baseDirectory string) []string {
 	
 	var diskGlobs [][]string
 	totalLength := 0
 
 	// Get the globs
 	for disk := 0; disk < PHYSICAL_DISKS; disk++ {
-		files, _ := filepath.Glob(path.Join(BASE_DIRECTORY,fmt.Sprintf("neuronal%d",disk),"neural_block_*.nb"))
+		files, _ := filepath.Glob(path.Join(baseDirectory,fmt.Sprintf("neuronal%d",disk),"neural_block_*.nb"))
 		diskGlobs = append(diskGlobs,files)
 		totalLength += len(files)
 	}
@@ -69,12 +66,12 @@ func getBlockFiles() []string {
 }
 
 // TODO we should interleave this too but not too worried about it now
-func getValueFiles(currentIteration int) []string {
+func getValueFiles(baseDirectory string, currentIteration int) []string {
 
 	var valueFilesToProcess []string
 
 	for disk := 0; disk < PHYSICAL_DISKS; disk++ {
-		outputFileGlob := path.Join(BASE_DIRECTORY,fmt.Sprintf("neuronal%d",disk),strconv.Itoa(currentIteration),"neural_block_*.nb.output")
+		outputFileGlob := path.Join(baseDirectory,fmt.Sprintf("neuronal%d",disk),strconv.Itoa(currentIteration),"neural_block_*.nb.output")
 		valueFilesOnDisk, _ := filepath.Glob(outputFileGlob)
 		valueFilesToProcess = append(valueFilesToProcess,valueFilesOnDisk...)
 	}
@@ -186,7 +183,7 @@ func loadValueFilesToArray(iteration int) {
 // Copied from here but there should be a more elegant way
 //TODO Connect this to redis
 // TODO this seems bad for the call stack, but I don't know any better in go
-func pollForDone(redisClient *redis.Client, redisKey string, totalNodes uint64) (bool, error) {
+func pollForDone(redisClient *redis.Client, redisKey string, totalNodes int) (bool, error) {
 
 	//timeout := time.After(1000 * time.Second)
 	timeout := time.After(20 * time.Second)
@@ -205,7 +202,7 @@ func pollForDone(redisClient *redis.Client, redisKey string, totalNodes uint64) 
 			return false, errors.New("timed out")
 		// Got a tick, we should check on doSomething()
 		case <-tick:
-			if completedNodes >= int(totalNodes) {
+			if completedNodes >= totalNodes {
 				return true, nil
 			} else {
 				pollForDone(redisClient, redisKey, totalNodes)	
@@ -383,18 +380,22 @@ func main() {
 
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
-	var blocks_per_node uint64 = uint64(math.Ceil((float64(TOTAL_NEURONS)/float64(NEURONS_IN_BLOCK))/float64(TOTAL_NODES)))
-	// TODO Account for stragglers in the last node
-
-	fmt.Printf("Running with %d blocks per node\n", blocks_per_node)
-
 	if len(os.Args) < 2 {
 		fmt.Println("Missing node number")
 		os.Exit(-1)
 	}
 
 	node,_ := strconv.Atoi(os.Args[1])
+	redis_server := os.Args[4]
+	baseDirectory := os.Args[3]
+	var totalNodes int
+	totalNodes,_ = strconv.Atoi(os.Args[2])
 	
+	var blocks_per_node uint64 = uint64(math.Ceil((float64(TOTAL_NEURONS)/float64(NEURONS_IN_BLOCK))/float64(totalNodes)))
+	// TODO Account for stragglers in the last node
+
+	fmt.Printf("Running with %d blocks per node\n", blocks_per_node)
+
 	// Worker per CPU
 	numberOfWorkers := runtime.NumCPU()
 
@@ -402,14 +403,14 @@ func main() {
 	var neuronStart uint64 = uint64(node) * blocks_per_node * uint64(NEURONS_IN_BLOCK)
 	var neuronEnd uint64 = uint64(node + 1) * blocks_per_node * uint64(NEURONS_IN_BLOCK)
 
-	redisClient := redis.NewClient(&redis.Options{Addr: REDIS_SERVER, Password: "", DB: 0})
+	redisClient := redis.NewClient(&redis.Options{Addr: redis_server, Password: "", DB: 0})
 
 	time1 := time.Now()
 	// Start by creating random sets of weights and connections, which we will read in and process
 	// on subsequent interations
 	neuralBlockFileChannel := make(chan string, blocks_per_node)
 	for block := 0; block < int(blocks_per_node); block++ {
-		neuralBlockFileChannel <- path.Join(BASE_DIRECTORY,blockNumberToDirectoryPrefix(block),fmt.Sprintf("neural_block_%03d_%07d.nb", node, block))
+		neuralBlockFileChannel <- path.Join(baseDirectory,blockNumberToDirectoryPrefix(block),fmt.Sprintf("neural_block_%03d_%07d.nb", node, block))
 	}
 	close(neuralBlockFileChannel)
 
@@ -440,7 +441,7 @@ func main() {
 
 		// Make sure there is a scratch directory for iteration
 		for disk := 0; disk < PHYSICAL_DISKS; disk++ {
-			os.Mkdir(path.Join(BASE_DIRECTORY,fmt.Sprintf("neuronal%d",disk),strconv.Itoa(currentIteration)), 0777)	
+			os.Mkdir(path.Join(baseDirectory,fmt.Sprintf("neuronal%d",disk),strconv.Itoa(currentIteration)), 0777)	
 		}
 
 		// On iteration 0, randomly generate neural values, otherwise we need to compute
@@ -449,11 +450,11 @@ func main() {
 			// This is iteration "0"
 			fmt.Printf("Initializing neuron values from %d to %d\n", neuronStart, neuronEnd)
 			// Arbitrarily choosing the first physical disk, TODO break this up more later
-			writeOutRandomValues(path.Join(BASE_DIRECTORY,"neuronal0","0"), node, neuronStart, neuronEnd)
+			writeOutRandomValues(path.Join(baseDirectory,"neuronal0","0"), node, neuronStart, neuronEnd)
 		} else {
 			// Fill channel with block files to process
 			// These neural block files contain connections and weights to execute the network
-			blockFilesToProcess := getBlockFiles()
+			blockFilesToProcess := getBlockFiles(baseDirectory)
 			blockFilesChannel := make(chan string, len(blockFilesToProcess))
 
 			fmt.Printf("Processing %d files\n", len(blockFilesToProcess))
@@ -478,7 +479,7 @@ func main() {
 
 		// Take the value files to consolidate and upload
 		// The value files store the values of each neuron for this iteration
-		valueFilesToProcess := getValueFiles(currentIteration)
+		valueFilesToProcess := getValueFiles(baseDirectory, currentIteration)
 		var valueFileGroups [][]string 
 
 		fmt.Printf("Processing %d files\n\n", len(valueFilesToProcess))
@@ -510,7 +511,7 @@ func main() {
 
 		// Poll periodically until everybody's done
 		fmt.Printf("Waiting for everybody to be done\n")
-		pollForDone(redisClient, iterationKey, TOTAL_NODES)
+		pollForDone(redisClient, iterationKey, totalNodes)
 
 		// Now iterate through all the files on S3
 		fmt.Printf("Loading value files for next iteration\n")
