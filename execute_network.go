@@ -14,15 +14,14 @@ import (
 	"io/ioutil"
 	"path/filepath"
 	"sync"
-	"github.com/go-redis/redis"
 	"github.com/aws/aws-sdk-go/aws"
   	"github.com/aws/aws-sdk-go/aws/awserr"
   	"github.com/aws/aws-sdk-go/aws/session"
   	"github.com/aws/aws-sdk-go/service/s3"
   	"github.com/aws/aws-sdk-go/service/s3/s3manager"
-	"errors"
 	"path"
 	"bytes"
+	"strings"
 )
 
 const CONNECTIONS_PER_NEURON = 1000
@@ -127,7 +126,7 @@ func writeNeuralBlockWorker(neuralBlockFileChannel <-chan string, wg *sync.WaitG
 // Load the latest iteration of weight files into in-memory array
 func loadValueFilesToArray(iteration int) {
 	//client, _ := hdfs.New("localhost:8020")
-	directoryName := fmt.Sprintf("%d/", iteration)
+	directoryName := fmt.Sprintf("%d/values/", iteration)
 	input := &s3.ListObjectsInput{
 		Bucket:  aws.String(NEURAL_DATA_BUCKET),
 		Prefix:	 aws.String(directoryName),
@@ -178,37 +177,28 @@ func loadValueFilesToArray(iteration int) {
 }
 
 
-// keepDoingSomething will keep trying to doSomething() until either
-// we get a result from doSomething() or the timeout expires
-// Copied from here but there should be a more elegant way
-//TODO Connect this to redis
-// TODO this seems bad for the call stack, but I don't know any better in go
-func pollForDone(redisClient *redis.Client, redisKey string, totalNodes int) (bool, error) {
+// Block until the completion files show up in S3
+func waitUntilOtherNodesDone(currentIteration int, totalNodes int) {
 
-	//timeout := time.After(1000 * time.Second)
-	timeout := time.After(20 * time.Second)
-	tick := time.Tick(5 * time.Second)
+	svc := s3.New(session.New())
 
-
-	val, _ := redisClient.Get(redisKey).Result()
-	completedNodes,_ := strconv.Atoi(val)
-	fmt.Printf("Iteration key = %d\n", completedNodes)
-
-	// Keep trying until we're timed out or got a result or got an error
-	for {
-		select {
-		// Got a timeout! fail with a timeout error
-		case <-timeout:
-			return false, errors.New("timed out")
-		// Got a tick, we should check on doSomething()
-		case <-tick:
-			if completedNodes >= totalNodes {
-				return true, nil
-			} else {
-				pollForDone(redisClient, redisKey, totalNodes)	
-			}
-		}
+	for currentNode := 0; currentNode < totalNodes; currentNode++ {
+		svc.WaitUntilObjectExists(&s3.HeadObjectInput{Bucket: aws.String(NEURAL_DATA_BUCKET), Key: aws.String(fmt.Sprintf("/%d/node%d.complete", currentIteration, currentNode))})
 	}
+}
+
+// Put an object into S3 to signify that this node is done for this iteration
+func markNodeAsDoneThisIteration(node int, currentIteration int) {
+
+	svc := s3.New(session.New())
+
+	input := &s3.PutObjectInput{
+	   	Body: aws.ReadSeekCloser(strings.NewReader("1")),
+	    Bucket: aws.String(NEURAL_DATA_BUCKET),
+	    Key:    aws.String(fmt.Sprintf("/%d/node%d.complete", currentIteration, node)),
+	}
+
+	svc.PutObject(input)
 }
 
 // From https://play.golang.org/p/sR0vNRAQD1
@@ -286,7 +276,7 @@ func consolidateFilesToDFS(iteration int, valueFileGroups <-chan []string, wg *s
 
 		fmt.Printf("Processing files %v\n", valueFileGroup)
 
-		outputFileName := fmt.Sprintf("/%d/%s", iteration, path.Base(valueFileGroup[0]))
+		outputFileName := fmt.Sprintf("/%d/values/%s", iteration, path.Base(valueFileGroup[0]))
 
 		var valueGroupBuffer []byte
 		for _, valueFile := range valueFileGroup {
@@ -386,7 +376,6 @@ func main() {
 	}
 
 	node,_ := strconv.Atoi(os.Args[1])
-	redis_server := os.Args[4]
 	baseDirectory := os.Args[3]
 	var totalNodes int
 	totalNodes,_ = strconv.Atoi(os.Args[2])
@@ -402,8 +391,6 @@ func main() {
 	// The range of neurons this node owns
 	var neuronStart uint64 = uint64(node) * blocks_per_node * uint64(NEURONS_IN_BLOCK)
 	var neuronEnd uint64 = uint64(node + 1) * blocks_per_node * uint64(NEURONS_IN_BLOCK)
-
-	redisClient := redis.NewClient(&redis.Options{Addr: redis_server, Password: "", DB: 0})
 
 	time1 := time.Now()
 	// Start by creating random sets of weights and connections, which we will read in and process
@@ -426,14 +413,6 @@ func main() {
 
 	// Keep track of iterations of the network by number, main execution loop
 	for currentIteration := 0; currentIteration <= MAX_ITERATIONS; currentIteration++ {
-
-		// Used to barrier sync the nodes on iteration
-		iterationKey := fmt.Sprintf("iteration_%d", currentIteration)
-
-		// Reset if around from previous runs
-		if node == 0 {
-			redisClient.Set(iterationKey, "0", 0)
-		}
 
 		fmt.Printf("Running iteration %d\n\n", currentIteration)
 		// TODO how often should we report on block files, there can be hundreds of thousands per node
@@ -507,11 +486,11 @@ func main() {
 		fileSyncWG.Wait()
 
 		// Signal that files for this iteration are processed and ready in S3 for other nodes to download
-		redisClient.Incr(iterationKey)
+		markNodeAsDoneThisIteration(node, currentIteration)
 
-		// Poll periodically until everybody's done
+		// Wait until everybody as marked done
 		fmt.Printf("Waiting for everybody to be done\n")
-		pollForDone(redisClient, iterationKey, totalNodes)
+		waitUntilOtherNodesDone(currentIteration, totalNodes)
 
 		// Now iterate through all the files on S3
 		fmt.Printf("Loading value files for next iteration\n")
