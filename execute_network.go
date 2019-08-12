@@ -25,7 +25,7 @@ import (
 )
 
 const CONNECTIONS_PER_NEURON = 1000
-const NEURONS_IN_BLOCK int = 10000
+const NEURONS_IN_BLOCK int = 100000
 const MAX_ITERATIONS int = 1
 const NEURAL_DATA_BUCKET = "spruce-goose-neural-data"
 // We consolidate value files, and here's how many we should put together
@@ -131,42 +131,44 @@ func loadValueFilesToArray(neuronValuesCurrentStep []float32, iteration int) {
 
 	svc := s3.New(session.New())
 
-	fmt.Printf("Checking bucket %s/%s\n", NEURAL_DATA_BUCKET, directoryName)
-	//fileNames, err := client.ReadDir(directoryName)
-	result, _ := svc.ListObjects(input)
-
 	// The session the S3 Downloader will use
 	sess := session.Must(session.NewSession())
 
 	// Create a downloader with the session and default options
 	downloader := s3manager.NewDownloader(sess)
 
-	//valueBuffer := make([]byte, 4)
 	currentNeuron := 0
 
-	fmt.Printf("Processing %d files\n", len(result.Contents))
+	// Example iterating over at most 3 pages of a ListObjects operation.
+	svc.ListObjectsPages(input,
+	    func(page *s3.ListObjectsOutput, lastPage bool) bool {
 
-	// TODO: Randomize?
-	for _, objects := range result.Contents {
+	    	fmt.Printf("Processing page of %d files\n", len(page.Contents))
+			
+			// TODO: Randomize?
+			for _, objects := range page.Contents {
 
-		buf := aws.NewWriteAtBuffer([]byte{})
+				buf := aws.NewWriteAtBuffer([]byte{})
 
-		// Write the contents of S3 Object to the file
-		n, _ := downloader.Download(buf, &s3.GetObjectInput{
-		    Bucket: aws.String(NEURAL_DATA_BUCKET),
-		    Key:    aws.String(*objects.Key),
-		})
+				// Write the contents of S3 Object to the file
+				n, _ := downloader.Download(buf, &s3.GetObjectInput{
+				    Bucket: aws.String(NEURAL_DATA_BUCKET),
+				    Key:    aws.String(*objects.Key),
+				})
 
-		fmt.Printf("file downloaded, %d bytes\n", n)
+				fmt.Printf("file downloaded, %d bytes\n", n)
 
-		weightData := buf.Bytes()
+				weightData := buf.Bytes()
 
-		for i := 0; i < len(weightData); i = i+4 {
-			neuronValuesCurrentStep[currentNeuron] = math.Float32frombits(binary.LittleEndian.Uint32(weightData[i:i+4]))
-			currentNeuron++
-		}
+				for i := 0; i < len(weightData); i = i+4 {
+					neuronValuesCurrentStep[currentNeuron] = math.Float32frombits(binary.LittleEndian.Uint32(weightData[i:i+4]))
+					currentNeuron++
+				}
 
-	}
+			}
+
+			return true
+	    })
 
 	fmt.Printf("Weights loaded = %d\n", currentNeuron)
 
@@ -237,7 +239,6 @@ func writeOutRandomValues(basePath string, node int, neuronStart uint64, neuronE
 }
 
 // Take a bunch of value files, and consolidate into fewer files up in HDFS
-// TODO Group the files
 func consolidateFilesToDFS(iteration int, valueFileGroups <-chan []string, wg *sync.WaitGroup) {
 
 	// TODO maybe I should use this uploader code:
@@ -318,7 +319,6 @@ func neuralBlockWorker(neuronValuesCurrentStep []float32, iteration int, blockFi
 		defer blockfile.Close()
 
 		// Open up file to store neuron output
-		//_ = os.Mkdir(fmt.Sprintf("%d", iteration), 0644)
 		dir, blockFile := path.Split(fileName)
 		outputFileName := path.Join(dir,strconv.Itoa(iteration),fmt.Sprintf("%s.output", blockFile))
 		outputfile, _ := os.OpenFile(outputFileName, os.O_CREATE|os.O_WRONLY, 0644)
